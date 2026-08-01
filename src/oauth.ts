@@ -16,21 +16,15 @@ const clerkClient =
       })
     : undefined;
 
-// Clerk's Account Portal (hosted sign-in/sign-up) host is derived from the
-// publishable key: pk_<env>_<base64(frontendApiHost + "$")>. The frontend
-// API host is "<slug>.clerk.accounts.dev"; the Account Portal for the same
-// instance drops the ".clerk" segment: "<slug>.accounts.dev".
-function clerkAccountPortalUrl(publishableKey: string, path: "sign-in" | "sign-up") {
+// Clerk's Frontend API host is derived from the publishable key:
+// pk_<env>_<base64(frontendApiHost + "$")>. Used to load Clerk's JS SDK
+// directly from Clerk's own CDN for a same-origin, no-framework sign-in page
+// (avoids the hosted Account Portal's cross-origin redirect_url validation).
+function clerkFrontendApiHost(publishableKey: string) {
   const encoded = publishableKey.split("_")[2] ?? "";
   const padded = encoded + "=".repeat((4 - (encoded.length % 4)) % 4);
-  const frontendApiHost = Buffer.from(padded, "base64").toString("utf8").replace(/\$$/, "");
-  const accountPortalHost = frontendApiHost.replace(/^([^.]+)\.clerk\./, "$1.");
-  return `https://${accountPortalHost}/${path}`;
+  return Buffer.from(padded, "base64").toString("utf8").replace(/\$$/, "");
 }
-
-const clerkSignInUrl = process.env.CLERK_PUBLISHABLE_KEY
-  ? clerkAccountPortalUrl(process.env.CLERK_PUBLISHABLE_KEY, "sign-in")
-  : undefined;
 
 interface Client {
   client_id: string;
@@ -150,6 +144,52 @@ export function createOAuthRoutes(baseUrl: string) {
     );
   });
 
+  // Self-hosted sign-in page using Clerk's vanilla JS SDK, served from our
+  // own origin so the resulting session cookie is same-origin with /authorize
+  // (sidesteps the hosted Account Portal's cross-origin redirect_url rules).
+  oauth.get("/sign-in", (c) => {
+    if (!process.env.CLERK_PUBLISHABLE_KEY) {
+      return c.text("Server misconfigured: CLERK_PUBLISHABLE_KEY not set", 500);
+    }
+    const publishableKey = process.env.CLERK_PUBLISHABLE_KEY;
+    const frontendApiHost = clerkFrontendApiHost(publishableKey);
+    const redirectUrl = c.req.query("redirect_url") ?? baseUrl;
+
+    return c.html(`<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"><title>Sign in</title>
+<style>body{font-family:system-ui,sans-serif;max-width:420px;margin:80px auto;padding:0 20px}</style>
+<script
+  async
+  crossorigin="anonymous"
+  data-clerk-publishable-key="${publishableKey}"
+  src="https://${frontendApiHost}/npm/@clerk/clerk-js@latest/dist/clerk.browser.js"
+  type="text/javascript"
+></script>
+</head>
+<body>
+  <div id="sign-in"></div>
+  <script>
+    window.addEventListener("load", async function () {
+      await window.Clerk.load();
+      if (window.Clerk.user) {
+        window.location.href = ${JSON.stringify(redirectUrl)};
+        return;
+      }
+      window.Clerk.addListener(({ user }) => {
+        if (user) window.location.href = ${JSON.stringify(redirectUrl)};
+      });
+      window.Clerk.mountSignIn(document.getElementById("sign-in"), {
+        forceRedirectUrl: ${JSON.stringify(redirectUrl)},
+        fallbackRedirectUrl: ${JSON.stringify(redirectUrl)},
+      });
+    });
+  </script>
+</body>
+</html>`);
+  });
+
   // Authorization endpoint - gated by a Clerk session; any signed-up Clerk
   // user can approve.
   oauth.get("/authorize", async (c) => {
@@ -164,7 +204,7 @@ export function createOAuthRoutes(baseUrl: string) {
     }
 
     if (requestState.status !== "signed-in") {
-      const signInUrl = new URL(requestState.signInUrl || clerkSignInUrl || "");
+      const signInUrl = new URL(`${baseUrl}/sign-in`);
       signInUrl.searchParams.set("redirect_url", c.req.url);
       return c.redirect(signInUrl.toString());
     }
