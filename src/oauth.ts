@@ -1,11 +1,36 @@
 import { Hono } from "hono";
-import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
+import { createClerkClient } from "@clerk/backend";
 
-// Minimal single-user OAuth 2.1 authorization server implementing just enough
-// of RFC 8414 (metadata), RFC 7591 (dynamic client registration), RFC 9728
-// (protected resource metadata), and authorization-code + PKCE for the MCP
-// authorization spec. There is exactly one "user" (whoever controls this
-// deploy), so the consent screen has no real login - it just confirms.
+// OAuth 2.1 authorization server implementing just enough of RFC 8414
+// (metadata), RFC 7591 (dynamic client registration), RFC 9728 (protected
+// resource metadata), and authorization-code + PKCE for the MCP
+// authorization spec. End-user identity for the consent screen is delegated
+// to Clerk - any signed-up Clerk user can approve an authorization request.
+
+const clerkClient =
+  process.env.CLERK_SECRET_KEY && process.env.CLERK_PUBLISHABLE_KEY
+    ? createClerkClient({
+        secretKey: process.env.CLERK_SECRET_KEY,
+        publishableKey: process.env.CLERK_PUBLISHABLE_KEY,
+      })
+    : undefined;
+
+// Clerk's Account Portal (hosted sign-in/sign-up) host is derived from the
+// publishable key: pk_<env>_<base64(frontendApiHost + "$")>. The frontend
+// API host is "<slug>.clerk.accounts.dev"; the Account Portal for the same
+// instance drops the ".clerk" segment: "<slug>.accounts.dev".
+function clerkAccountPortalUrl(publishableKey: string, path: "sign-in" | "sign-up") {
+  const encoded = publishableKey.split("_")[2] ?? "";
+  const padded = encoded + "=".repeat((4 - (encoded.length % 4)) % 4);
+  const frontendApiHost = Buffer.from(padded, "base64").toString("utf8").replace(/\$$/, "");
+  const accountPortalHost = frontendApiHost.replace(/^([^.]+)\.clerk\./, "$1.");
+  return `https://${accountPortalHost}/${path}`;
+}
+
+const clerkSignInUrl = process.env.CLERK_PUBLISHABLE_KEY
+  ? clerkAccountPortalUrl(process.env.CLERK_PUBLISHABLE_KEY, "sign-in")
+  : undefined;
 
 interface Client {
   client_id: string;
@@ -21,6 +46,7 @@ interface PendingAuthorization {
   code_challenge: string;
   code_challenge_method: string;
   resource?: string;
+  user_id: string;
 }
 
 interface AuthCode extends PendingAuthorization {
@@ -29,6 +55,7 @@ interface AuthCode extends PendingAuthorization {
 
 interface IssuedToken {
   client_id: string;
+  user_id: string;
   expiresAt: number;
 }
 
@@ -53,12 +80,6 @@ function verifyPkce(codeVerifier: string, codeChallenge: string, method: string)
   if (method !== "S256") return false;
   const hash = createHash("sha256").update(codeVerifier).digest();
   return base64url(hash) === codeChallenge;
-}
-
-function verifyOwnerPassword(input: string, expected: string) {
-  const a = createHash("sha256").update(input).digest();
-  const b = createHash("sha256").update(expected).digest();
-  return timingSafeEqual(a, b);
 }
 
 export function isValidAccessToken(bearerToken: string): boolean {
@@ -129,8 +150,27 @@ export function createOAuthRoutes(baseUrl: string) {
     );
   });
 
-  // Authorization endpoint - single-user consent screen
-  oauth.get("/authorize", (c) => {
+  // Authorization endpoint - gated by a Clerk session; any signed-up Clerk
+  // user can approve.
+  oauth.get("/authorize", async (c) => {
+    if (!clerkClient) return c.text("Server misconfigured: CLERK_SECRET_KEY / CLERK_PUBLISHABLE_KEY not set", 500);
+
+    const requestState = await clerkClient.authenticateRequest(c.req.raw, {
+      authorizedParties: [baseUrl, new URL(baseUrl).origin],
+    });
+
+    if (requestState.status === "handshake") {
+      return new Response(null, { status: 307, headers: requestState.headers });
+    }
+
+    if (requestState.status !== "signed-in") {
+      const signInUrl = new URL(requestState.signInUrl || clerkSignInUrl || "");
+      signInUrl.searchParams.set("redirect_url", c.req.url);
+      return c.redirect(signInUrl.toString());
+    }
+
+    const { userId } = requestState.toAuth();
+
     const client_id = c.req.query("client_id") ?? "";
     const redirect_uri = c.req.query("redirect_uri") ?? "";
     const state = c.req.query("state");
@@ -159,23 +199,31 @@ export function createOAuthRoutes(baseUrl: string) {
       code_challenge,
       code_challenge_method,
       resource,
+      user_id: userId,
     });
+
+    let identity = userId;
+    try {
+      const user = await clerkClient.users.getUser(userId);
+      identity = user.primaryEmailAddress?.emailAddress ?? userId;
+    } catch {
+      // fall back to userId if the lookup fails
+    }
 
     return c.html(`<!doctype html>
 <html>
 <head><meta charset="utf-8"><title>Authorize</title>
 <style>body{font-family:system-ui,sans-serif;max-width:420px;margin:80px auto;padding:0 20px}
-input{width:100%;padding:8px;margin:8px 0 16px;font-size:15px;box-sizing:border-box}
 button{padding:10px 20px;margin-right:10px;font-size:15px;cursor:pointer}
 .approve{background:#111;color:#fff;border:none;border-radius:6px}
 .deny{background:none;border:1px solid #ccc;border-radius:6px}</style>
 </head>
 <body>
   <h2>Authorize access</h2>
-  <p>An application is requesting access to the items MCP server. Enter the owner password to approve.</p>
+  <p>Signed in as <strong>${identity}</strong>.</p>
+  <p>An application is requesting access to the items MCP server.</p>
   <form method="POST" action="/authorize/approve">
     <input type="hidden" name="request_id" value="${requestId}" />
-    <input type="password" name="password" placeholder="Owner password" autofocus required />
     <button class="approve" type="submit">Approve</button>
     <button class="deny" formaction="/authorize/deny" formnovalidate type="submit">Deny</button>
   </form>
@@ -184,18 +232,21 @@ button{padding:10px 20px;margin-right:10px;font-size:15px;cursor:pointer}
   });
 
   oauth.post("/authorize/approve", async (c) => {
+    if (!clerkClient) return c.text("Server misconfigured: CLERK_SECRET_KEY / CLERK_PUBLISHABLE_KEY not set", 500);
+
+    const requestState = await clerkClient.authenticateRequest(c.req.raw, {
+      authorizedParties: [baseUrl, new URL(baseUrl).origin],
+    });
+    if (requestState.status !== "signed-in") {
+      return c.text("Not signed in", 401);
+    }
+
     const body = await c.req.parseBody();
     const requestId = String(body.request_id ?? "");
     const pending = pendingAuthorizations.get(requestId);
     if (!pending) return c.text("Authorization request not found or expired", 400);
-
-    const ownerPassword = process.env.OWNER_PASSWORD;
-    if (!ownerPassword) {
-      return c.text("Server misconfigured: OWNER_PASSWORD is not set", 500);
-    }
-    const submittedPassword = String(body.password ?? "");
-    if (!verifyOwnerPassword(submittedPassword, ownerPassword)) {
-      return c.text("Incorrect password", 401);
+    if (pending.user_id !== requestState.toAuth().userId) {
+      return c.text("This authorization request belongs to a different user", 403);
     }
 
     pendingAuthorizations.delete(requestId);
@@ -264,8 +315,8 @@ button{padding:10px 20px;margin-right:10px;font-size:15px;cursor:pointer}
       const access_token = token(32);
       const refresh_token = token(32);
       const expiresAt = Date.now() + ACCESS_TOKEN_TTL_MS;
-      accessTokens.set(access_token, { client_id, expiresAt });
-      refreshTokens.set(refresh_token, { client_id, expiresAt: Infinity });
+      accessTokens.set(access_token, { client_id, user_id: authCode.user_id, expiresAt });
+      refreshTokens.set(refresh_token, { client_id, user_id: authCode.user_id, expiresAt: Infinity });
 
       return c.json({
         access_token,
@@ -284,7 +335,7 @@ button{padding:10px 20px;margin-right:10px;font-size:15px;cursor:pointer}
 
       const access_token = token(32);
       const expiresAt = Date.now() + ACCESS_TOKEN_TTL_MS;
-      accessTokens.set(access_token, { client_id, expiresAt });
+      accessTokens.set(access_token, { client_id, user_id: issued.user_id, expiresAt });
 
       return c.json({
         access_token,

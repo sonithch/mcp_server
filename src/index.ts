@@ -29,7 +29,7 @@ app.use(
 app.get("/health", (c) => c.json({ status: "ok" }));
 
 const port = Number(process.env.PORT) || 3001;
-const baseUrl = process.env.PUBLIC_URL ?? process.env.RENDER_EXTERNAL_URL ?? `http://localhost:${port}`;
+const baseUrl = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${port}`;
 const mcpAuthToken = process.env.MCP_AUTH_TOKEN;
 
 app.route("/", createOAuthRoutes(baseUrl));
