@@ -1,4 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
   listItems,
@@ -10,11 +12,18 @@ import {
   searchItems,
 } from "./items-store.js";
 
+type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+
 function textResult(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
 }
 
-export function createMcpServer(actor: string) {
+function actorFrom(extra: Extra): string {
+  const userId = extra.authInfo?.extra?.userId;
+  return typeof userId === "string" ? userId : "unknown";
+}
+
+export function createMcpServer() {
   const server = new McpServer({
     name: "items-mcp-server",
     version: "1.0.0",
@@ -51,7 +60,7 @@ export function createMcpServer(actor: string) {
         description: z.string().optional().describe("Item description"),
       },
     },
-    async ({ name, description }) => textResult(createItem(name, description, actor))
+    async ({ name, description }, extra) => textResult(createItem(name, description, actorFrom(extra)))
   );
 
   server.registerTool(
@@ -69,7 +78,7 @@ export function createMcpServer(actor: string) {
           .describe("Items to create"),
       },
     },
-    async ({ items }) => textResult(createItems(items, actor))
+    async ({ items }, extra) => textResult(createItems(items, actorFrom(extra)))
   );
 
   server.registerTool(
@@ -82,8 +91,8 @@ export function createMcpServer(actor: string) {
         description: z.string().optional().describe("New description"),
       },
     },
-    async ({ id, name, description }) => {
-      const item = updateItem(id, { name, description }, actor);
+    async ({ id, name, description }, extra) => {
+      const item = updateItem(id, { name, description }, actorFrom(extra));
       if (!item) throw new Error(`Item ${id} not found`);
       return textResult(item);
     }

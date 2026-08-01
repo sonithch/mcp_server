@@ -1,9 +1,15 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { clerkMiddleware, getAuth } from "@clerk/hono";
+import {
+  mcpAuth,
+  protectedResourceHandlerClerk,
+  authServerMetadataHandlerClerk,
+  streamableHttpHandler,
+} from "@clerk/mcp-tools/hono";
+import { verifyClerkToken } from "@clerk/mcp-tools/server";
 import { createMcpServer } from "./mcp-server.js";
-import { createOAuthRoutes, getAccessTokenUserId } from "./oauth.js";
 import {
   listItems,
   getItem,
@@ -14,7 +20,7 @@ import {
   searchItems,
 } from "./items-store.js";
 
-const app = new Hono<{ Variables: { actor: string } }>();
+const app = new Hono();
 
 app.use(
   "*",
@@ -25,30 +31,32 @@ app.use(
     exposeHeaders: ["mcp-session-id", "mcp-protocol-version"],
   })
 );
+app.use("*", clerkMiddleware());
 
 app.get("/health", (c) => c.json({ status: "ok" }));
 
 const port = Number(process.env.PORT) || 3001;
-const baseUrl = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${port}`;
 const mcpAuthToken = process.env.MCP_AUTH_TOKEN;
 
-app.route("/", createOAuthRoutes(baseUrl));
+// OAuth server is Clerk itself - these two just describe how to reach it and
+// what resource (/mcp) it protects. Create an "OAuth Application" in the
+// Clerk Dashboard to get a client_id/secret for claude.ai (Clerk doesn't
+// support Dynamic Client Registration).
+app.get("/.well-known/oauth-protected-resource/mcp", protectedResourceHandlerClerk());
+app.get("/.well-known/oauth-authorization-server", authServerMetadataHandlerClerk);
 
-app.use("/mcp", async (c, next) => {
-  const authHeader = c.req.header("Authorization");
-  const bearer = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
-  const oauthUserId = bearer !== undefined ? getAccessTokenUserId(bearer) : undefined;
-  const authorized = bearer !== undefined && (bearer === mcpAuthToken || oauthUserId !== undefined);
-  if (!authorized) {
-    c.header(
-      "WWW-Authenticate",
-      `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`
-    );
-    return c.json({ error: "unauthorized" }, 401);
+// Accepts either a Clerk-issued OAuth token or the static MCP_AUTH_TOKEN
+// (for Claude Desktop's header-based config, which has no OAuth flow).
+const authenticateMcpRequest = mcpAuth(async (token, c) => {
+  if (mcpAuthToken && token === mcpAuthToken) {
+    return { token, scopes: [], clientId: "mcp-auth-token", extra: { userId: "mcp-auth-token" } };
   }
-  c.set("actor", oauthUserId ?? "mcp-auth-token");
-  await next();
+  const authData = getAuth(c, { acceptsToken: "oauth_token" });
+  if (!authData.isAuthenticated) return undefined;
+  return verifyClerkToken(authData, token);
 });
+
+app.post("/mcp", authenticateMcpRequest, streamableHttpHandler(createMcpServer));
 
 // Create
 app.post("/items", async (c) => {
@@ -103,14 +111,6 @@ app.delete("/items/:id", (c) => {
   const item = deleteItem(Number(c.req.param("id")));
   if (!item) return c.json({ error: "not found" }, 404);
   return c.json(item);
-});
-
-// MCP endpoint - stateless: fresh transport + server per request
-app.all("/mcp", async (c) => {
-  const transport = new WebStandardStreamableHTTPServerTransport();
-  const server = createMcpServer(c.get("actor"));
-  await server.connect(transport);
-  return transport.handleRequest(c.req.raw);
 });
 
 console.log(`Server running at http://localhost:${port}`);
