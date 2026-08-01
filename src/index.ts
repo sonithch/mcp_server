@@ -3,7 +3,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { createMcpServer } from "./mcp-server.js";
-import { createOAuthRoutes, isValidAccessToken } from "./oauth.js";
+import { createOAuthRoutes, getAccessTokenUserId } from "./oauth.js";
 import {
   listItems,
   getItem,
@@ -14,7 +14,7 @@ import {
   searchItems,
 } from "./items-store.js";
 
-const app = new Hono();
+const app = new Hono<{ Variables: { actor: string } }>();
 
 app.use(
   "*",
@@ -37,7 +37,8 @@ app.route("/", createOAuthRoutes(baseUrl));
 app.use("/mcp", async (c, next) => {
   const authHeader = c.req.header("Authorization");
   const bearer = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
-  const authorized = bearer !== undefined && (bearer === mcpAuthToken || isValidAccessToken(bearer));
+  const oauthUserId = bearer !== undefined ? getAccessTokenUserId(bearer) : undefined;
+  const authorized = bearer !== undefined && (bearer === mcpAuthToken || oauthUserId !== undefined);
   if (!authorized) {
     c.header(
       "WWW-Authenticate",
@@ -45,6 +46,7 @@ app.use("/mcp", async (c, next) => {
     );
     return c.json({ error: "unauthorized" }, 401);
   }
+  c.set("actor", oauthUserId ?? "mcp-auth-token");
   await next();
 });
 
@@ -54,7 +56,7 @@ app.post("/items", async (c) => {
   if (!body.name) {
     return c.json({ error: "name is required" }, 400);
   }
-  return c.json(createItem(body.name, body.description ?? ""), 201);
+  return c.json(createItem(body.name, body.description ?? "", "api"), 201);
 });
 
 // Batch create
@@ -67,7 +69,7 @@ app.post("/items/batch", async (c) => {
   if (invalidIndex !== -1) {
     return c.json({ error: `items[${invalidIndex}].name is required` }, 400);
   }
-  const created = createItems(body.items as { name: string; description?: string }[]);
+  const created = createItems(body.items as { name: string; description?: string }[], "api");
   return c.json(created, 201);
 });
 
@@ -91,7 +93,7 @@ app.get("/items/:id", (c) => {
 app.put("/items/:id", async (c) => {
   const id = Number(c.req.param("id"));
   const body = await c.req.json<{ name?: string; description?: string }>();
-  const item = updateItem(id, body);
+  const item = updateItem(id, body, "api");
   if (!item) return c.json({ error: "not found" }, 404);
   return c.json(item);
 });
@@ -106,7 +108,7 @@ app.delete("/items/:id", (c) => {
 // MCP endpoint - stateless: fresh transport + server per request
 app.all("/mcp", async (c) => {
   const transport = new WebStandardStreamableHTTPServerTransport();
-  const server = createMcpServer();
+  const server = createMcpServer(c.get("actor"));
   await server.connect(transport);
   return transport.handleRequest(c.req.raw);
 });

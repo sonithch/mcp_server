@@ -2,6 +2,8 @@ export type Item = {
   id: number;
   name: string;
   description: string;
+  createdBy: string;
+  updatedBy: string;
 };
 
 let items: Item[] = [];
@@ -15,24 +17,29 @@ export function getItem(id: number): Item | undefined {
   return items.find((i) => i.id === id);
 }
 
-export function createItem(name: string, description = ""): Item {
-  const item: Item = { id: nextId++, name, description };
+export function createItem(name: string, description = "", actor: string): Item {
+  const item: Item = { id: nextId++, name, description, createdBy: actor, updatedBy: actor };
   items.push(item);
   return item;
 }
 
-export function createItems(inputs: { name: string; description?: string }[]): Item[] {
-  return inputs.map((input) => createItem(input.name, input.description ?? ""));
+export function createItems(
+  inputs: { name: string; description?: string }[],
+  actor: string
+): Item[] {
+  return inputs.map((input) => createItem(input.name, input.description ?? "", actor));
 }
 
 export function updateItem(
   id: number,
-  changes: { name?: string; description?: string }
+  changes: { name?: string; description?: string },
+  actor: string
 ): Item | undefined {
   const item = getItem(id);
   if (!item) return undefined;
   if (changes.name !== undefined) item.name = changes.name;
   if (changes.description !== undefined) item.description = changes.description;
+  item.updatedBy = actor;
   return item;
 }
 

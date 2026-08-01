@@ -77,13 +77,19 @@ function verifyPkce(codeVerifier: string, codeChallenge: string, method: string)
 }
 
 export function isValidAccessToken(bearerToken: string): boolean {
+  return getAccessTokenUserId(bearerToken) !== undefined;
+}
+
+// Returns the Clerk user_id tied to a valid, unexpired access token, or
+// undefined if the token is invalid/expired.
+export function getAccessTokenUserId(bearerToken: string): string | undefined {
   const issued = accessTokens.get(bearerToken);
-  if (!issued) return false;
+  if (!issued) return undefined;
   if (issued.expiresAt < Date.now()) {
     accessTokens.delete(bearerToken);
-    return false;
+    return undefined;
   }
-  return true;
+  return issued.user_id;
 }
 
 export function createOAuthRoutes(baseUrl: string) {

@@ -14,7 +14,7 @@ function textResult(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
 }
 
-export function createMcpServer() {
+export function createMcpServer(actor: string) {
   const server = new McpServer({
     name: "items-mcp-server",
     version: "1.0.0",
@@ -51,7 +51,7 @@ export function createMcpServer() {
         description: z.string().optional().describe("Item description"),
       },
     },
-    async ({ name, description }) => textResult(createItem(name, description))
+    async ({ name, description }) => textResult(createItem(name, description, actor))
   );
 
   server.registerTool(
@@ -69,7 +69,7 @@ export function createMcpServer() {
           .describe("Items to create"),
       },
     },
-    async ({ items }) => textResult(createItems(items))
+    async ({ items }) => textResult(createItems(items, actor))
   );
 
   server.registerTool(
@@ -83,7 +83,7 @@ export function createMcpServer() {
       },
     },
     async ({ id, name, description }) => {
-      const item = updateItem(id, { name, description });
+      const item = updateItem(id, { name, description }, actor);
       if (!item) throw new Error(`Item ${id} not found`);
       return textResult(item);
     }
