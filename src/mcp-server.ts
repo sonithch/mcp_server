@@ -4,6 +4,7 @@ import {
   listItems,
   getItem,
   createItem,
+  createItems,
   updateItem,
   deleteItem,
   searchItems,
@@ -51,6 +52,24 @@ export function createMcpServer() {
       },
     },
     async ({ name, description }) => textResult(createItem(name, description))
+  );
+
+  server.registerTool(
+    "create_items",
+    {
+      description: "Create multiple items at once",
+      inputSchema: {
+        items: z
+          .array(
+            z.object({
+              name: z.string().describe("Item name"),
+              description: z.string().optional().describe("Item description"),
+            })
+          )
+          .describe("Items to create"),
+      },
+    },
+    async ({ items }) => textResult(createItems(items))
   );
 
   server.registerTool(

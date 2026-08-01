@@ -8,6 +8,7 @@ import {
   listItems,
   getItem,
   createItem,
+  createItems,
   updateItem,
   deleteItem,
   searchItems,
@@ -54,6 +55,20 @@ app.post("/items", async (c) => {
     return c.json({ error: "name is required" }, 400);
   }
   return c.json(createItem(body.name, body.description ?? ""), 201);
+});
+
+// Batch create
+app.post("/items/batch", async (c) => {
+  const body = await c.req.json<{ items?: { name?: string; description?: string }[] }>();
+  if (!Array.isArray(body.items) || body.items.length === 0) {
+    return c.json({ error: "items must be a non-empty array" }, 400);
+  }
+  const invalidIndex = body.items.findIndex((item) => !item.name);
+  if (invalidIndex !== -1) {
+    return c.json({ error: `items[${invalidIndex}].name is required` }, 400);
+  }
+  const created = createItems(body.items as { name: string; description?: string }[]);
+  return c.json(created, 201);
 });
 
 // Search (must be defined before /items/:id)

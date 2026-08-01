@@ -21,6 +21,10 @@ export function createItem(name: string, description = ""): Item {
   return item;
 }
 
+export function createItems(inputs: { name: string; description?: string }[]): Item[] {
+  return inputs.map((input) => createItem(input.name, input.description ?? ""));
+}
+
 export function updateItem(
   id: number,
   changes: { name?: string; description?: string }
