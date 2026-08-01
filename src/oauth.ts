@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
 
 // Minimal single-user OAuth 2.1 authorization server implementing just enough
 // of RFC 8414 (metadata), RFC 7591 (dynamic client registration), RFC 9728
@@ -53,6 +53,12 @@ function verifyPkce(codeVerifier: string, codeChallenge: string, method: string)
   if (method !== "S256") return false;
   const hash = createHash("sha256").update(codeVerifier).digest();
   return base64url(hash) === codeChallenge;
+}
+
+function verifyOwnerPassword(input: string, expected: string) {
+  const a = createHash("sha256").update(input).digest();
+  const b = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(a, b);
 }
 
 export function isValidAccessToken(bearerToken: string): boolean {
@@ -159,17 +165,19 @@ export function createOAuthRoutes(baseUrl: string) {
 <html>
 <head><meta charset="utf-8"><title>Authorize</title>
 <style>body{font-family:system-ui,sans-serif;max-width:420px;margin:80px auto;padding:0 20px}
+input{width:100%;padding:8px;margin:8px 0 16px;font-size:15px;box-sizing:border-box}
 button{padding:10px 20px;margin-right:10px;font-size:15px;cursor:pointer}
 .approve{background:#111;color:#fff;border:none;border-radius:6px}
 .deny{background:none;border:1px solid #ccc;border-radius:6px}</style>
 </head>
 <body>
   <h2>Authorize access</h2>
-  <p>An application is requesting access to the items MCP server.</p>
+  <p>An application is requesting access to the items MCP server. Enter the owner password to approve.</p>
   <form method="POST" action="/authorize/approve">
     <input type="hidden" name="request_id" value="${requestId}" />
+    <input type="password" name="password" placeholder="Owner password" autofocus required />
     <button class="approve" type="submit">Approve</button>
-    <button class="deny" formaction="/authorize/deny" type="submit">Deny</button>
+    <button class="deny" formaction="/authorize/deny" formnovalidate type="submit">Deny</button>
   </form>
 </body>
 </html>`);
@@ -180,6 +188,16 @@ button{padding:10px 20px;margin-right:10px;font-size:15px;cursor:pointer}
     const requestId = String(body.request_id ?? "");
     const pending = pendingAuthorizations.get(requestId);
     if (!pending) return c.text("Authorization request not found or expired", 400);
+
+    const ownerPassword = process.env.OWNER_PASSWORD;
+    if (!ownerPassword) {
+      return c.text("Server misconfigured: OWNER_PASSWORD is not set", 500);
+    }
+    const submittedPassword = String(body.password ?? "");
+    if (!verifyOwnerPassword(submittedPassword, ownerPassword)) {
+      return c.text("Incorrect password", 401);
+    }
+
     pendingAuthorizations.delete(requestId);
 
     const code = token(32);
