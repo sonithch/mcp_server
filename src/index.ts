@@ -5,10 +5,9 @@ import { clerkMiddleware, getAuth } from "@clerk/hono";
 import {
   mcpAuth,
   protectedResourceHandlerClerk,
-  authServerMetadataHandlerClerk,
   streamableHttpHandler,
 } from "@clerk/mcp-tools/hono";
-import { verifyClerkToken } from "@clerk/mcp-tools/server";
+import { fetchClerkAuthorizationServerMetadata, verifyClerkToken } from "@clerk/mcp-tools/server";
 import { createMcpServer } from "./mcp-server.js";
 import {
   listItems,
@@ -37,13 +36,45 @@ app.get("/health", (c) => c.json({ status: "ok" }));
 
 const port = Number(process.env.PORT) || 3001;
 const mcpAuthToken = process.env.MCP_AUTH_TOKEN;
+const clerkPublicClientId = process.env.CLERK_PUBLIC_CLIENT_ID;
 
-// OAuth server is Clerk itself - these two just describe how to reach it and
-// what resource (/mcp) it protects. Create an "OAuth Application" in the
-// Clerk Dashboard to get a client_id/secret for claude.ai (Clerk doesn't
-// support Dynamic Client Registration).
+// OAuth server is Clerk itself - these describe how to reach it and what
+// resource (/mcp) it protects. Clerk has no Dynamic Client Registration, so
+// we fake it: /register always hands back the same pre-created public OAuth
+// Application (no secret, PKCE-only) instead of minting a new Clerk client
+// per caller. This lets any user add the server by URL alone - no manual
+// client_id/secret entry - while every user still does their own Clerk
+// sign-in/consent and gets their own personal access token.
 app.get("/.well-known/oauth-protected-resource/mcp", protectedResourceHandlerClerk());
-app.get("/.well-known/oauth-authorization-server", authServerMetadataHandlerClerk);
+
+app.get("/.well-known/oauth-authorization-server", async (c) => {
+  const publishableKey = process.env.CLERK_PUBLISHABLE_KEY;
+  if (!publishableKey) return c.text("Server misconfigured: CLERK_PUBLISHABLE_KEY not set", 500);
+  const metadata = await fetchClerkAuthorizationServerMetadata({ publishableKey });
+  return c.json({
+    ...metadata,
+    ...(clerkPublicClientId ? { registration_endpoint: `${new URL(c.req.url).origin}/register` } : {}),
+  });
+});
+
+app.post("/register", async (c) => {
+  if (!clerkPublicClientId) {
+    return c.json({ error: "invalid_request", error_description: "Dynamic registration is not configured" }, 400);
+  }
+  const body = await c.req
+    .json<{ redirect_uris?: string[] }>()
+    .catch((): { redirect_uris?: string[] } => ({}));
+  return c.json(
+    {
+      client_id: clerkPublicClientId,
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      redirect_uris: body.redirect_uris ?? [],
+    },
+    201
+  );
+});
 
 // Accepts either a Clerk-issued OAuth token or the static MCP_AUTH_TOKEN
 // (for Claude Desktop's header-based config, which has no OAuth flow).
