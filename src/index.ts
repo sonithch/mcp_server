@@ -1,9 +1,9 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { bearerAuth } from "hono/bearer-auth";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { createMcpServer } from "./mcp-server.js";
+import { createOAuthRoutes, isValidAccessToken } from "./oauth.js";
 import {
   listItems,
   getItem,
@@ -27,13 +27,25 @@ app.use(
 
 app.get("/health", (c) => c.json({ status: "ok" }));
 
+const port = Number(process.env.PORT) || 3001;
+const baseUrl = process.env.PUBLIC_URL ?? process.env.RENDER_EXTERNAL_URL ?? `http://localhost:${port}`;
 const mcpAuthToken = process.env.MCP_AUTH_TOKEN;
-if (!mcpAuthToken && process.env.NODE_ENV === "production") {
-  throw new Error("MCP_AUTH_TOKEN must be set in production");
-}
-if (mcpAuthToken) {
-  app.use("/mcp", bearerAuth({ token: mcpAuthToken }));
-}
+
+app.route("/", createOAuthRoutes(baseUrl));
+
+app.use("/mcp", async (c, next) => {
+  const authHeader = c.req.header("Authorization");
+  const bearer = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
+  const authorized = bearer !== undefined && (bearer === mcpAuthToken || isValidAccessToken(bearer));
+  if (!authorized) {
+    c.header(
+      "WWW-Authenticate",
+      `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`
+    );
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  await next();
+});
 
 // Create
 app.post("/items", async (c) => {
@@ -84,7 +96,6 @@ app.all("/mcp", async (c) => {
   return transport.handleRequest(c.req.raw);
 });
 
-const port = Number(process.env.PORT) || 3001;
 console.log(`Server running at http://localhost:${port}`);
 console.log(`MCP endpoint: http://localhost:${port}/mcp`);
 
