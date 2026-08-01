@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { bearerAuth } from "hono/bearer-auth";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { createMcpServer } from "./mcp-server.js";
 import {
@@ -25,6 +26,14 @@ app.use(
 );
 
 app.get("/health", (c) => c.json({ status: "ok" }));
+
+const mcpAuthToken = process.env.MCP_AUTH_TOKEN;
+if (!mcpAuthToken && process.env.NODE_ENV === "production") {
+  throw new Error("MCP_AUTH_TOKEN must be set in production");
+}
+if (mcpAuthToken) {
+  app.use("/mcp", bearerAuth({ token: mcpAuthToken }));
+}
 
 // Create
 app.post("/items", async (c) => {
