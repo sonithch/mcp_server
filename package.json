@@ -7,11 +7,11 @@
     "start": "tsx --env-file-if-exists=.env src/index.ts"
   },
   "dependencies": {
-    "@clerk/hono": "^0.1.59",
     "@clerk/mcp-tools": "^0.6.0",
     "@hono/node-server": "^1.13.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "hono": "^4.6.0",
+    "jose": "^6.2.8",
     "zod": "^4.4.3"
   },
   "devDependencies": {

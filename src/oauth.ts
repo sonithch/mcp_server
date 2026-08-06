@@ -1,28 +1,58 @@
 import { Hono } from "hono";
-import { clerkMiddleware, getAuth } from "@clerk/hono";
+import { randomUUID, randomBytes, createHash } from "node:crypto";
+import { SignJWT, jwtVerify } from "jose";
 import { mcpAuth, streamableHttpHandler } from "@clerk/mcp-tools/hono";
-import { fetchClerkAuthorizationServerMetadata, verifyClerkToken } from "@clerk/mcp-tools/server";
 import { createMcpServer } from "./mcp-server.js";
 
-// We declare OURSELVES as the OAuth issuer (not Clerk) so that spec-compliant
-// clients discover authorization-server metadata - including /register - from
-// our own domain. Per RFC 8414/9728, a client fetches AS metadata from the
-// issuer's own host, so pointing authorization_servers at Clerk directly (as
-// @clerk/mcp-tools' Clerk-flavored helpers do) means our injected
-// registration_endpoint would never be seen: the client would fetch Clerk's
-// real, unmodified metadata (no DCR support) straight from Clerk's domain.
-// Instead, /authorize and /token below thinly proxy to Clerk's real endpoints.
+// This server is its own, self-contained OAuth 2.0 authorization server -
+// no external identity provider. There's no real user login: /authorize
+// renders a plain Approve/Reject page, and clicking Approve is the entire
+// "authentication" step. This trades real identity for simplicity; anyone
+// who reaches the server URL can grant themselves access. Fine for a
+// personal/low-stakes MCP server, not something to reuse for anything that
+// needs real access control.
 
 const mcpAuthToken = process.env.MCP_AUTH_TOKEN;
-const clerkPublicClientId = process.env.CLERK_PUBLIC_CLIENT_ID;
+
+// Signs/verifies our own access tokens. Falls back to a random secret
+// generated at boot if none is set - tokens then just stop working across
+// restarts (everyone re-approves), which is an acceptable tradeoff for how
+// this auth model works, but set OAUTH_JWT_SECRET in production to avoid
+// invalidating tokens on every deploy.
+const jwtSecret = new TextEncoder().encode(process.env.OAUTH_JWT_SECRET ?? randomBytes(32).toString("hex"));
+if (!process.env.OAUTH_JWT_SECRET) {
+  console.warn("[oauth] OAUTH_JWT_SECRET not set - using an ephemeral secret; tokens won't survive a restart");
+}
+
+interface RegisteredClient {
+  redirectUris: string[];
+}
+const registeredClients = new Map<string, RegisteredClient>();
+
+interface PendingAuthRequest {
+  clientId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  state?: string;
+  scope: string;
+}
+const pendingAuthRequests = new Map<string, PendingAuthRequest>();
+
+interface PendingCode {
+  clientId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  scope: string;
+  expiresAt: number;
+}
+const pendingCodes = new Map<string, PendingCode>();
 
 // Render (and most PaaS providers) terminate TLS at the edge and forward
 // plain HTTP internally, so c.req.url's own scheme is always "http" even
 // though the real, public-facing request was https. Self-advertising
-// "http://" endpoints in our OAuth metadata makes them unusable: clients
-// correctly refuse to exchange an authorization code for tokens over an
-// unencrypted URL, so /token was silently never being called. Trust
-// X-Forwarded-Proto/Host (set by the proxy) over the request's own URL.
+// "http://" endpoints breaks clients that (correctly) refuse to exchange a
+// code for tokens over an unencrypted URL. Trust the proxy's forwarded
+// headers over the request's own URL.
 function getPublicOrigin(c: { req: { url: string; header: (name: string) => string | undefined } }): string {
   const url = new URL(c.req.url);
   const proto = c.req.header("x-forwarded-proto")?.split(",")[0]?.trim() ?? url.protocol.replace(":", "");
@@ -30,164 +60,177 @@ function getPublicOrigin(c: { req: { url: string; header: (name: string) => stri
   return `${proto}://${host}`;
 }
 
-let clerkMetadataCache: Awaited<ReturnType<typeof fetchClerkAuthorizationServerMetadata>> | undefined;
-async function getClerkMetadata() {
-  const publishableKey = process.env.CLERK_PUBLISHABLE_KEY;
-  if (!publishableKey) throw new Error("CLERK_PUBLISHABLE_KEY not set");
-  clerkMetadataCache ??= await fetchClerkAuthorizationServerMetadata({ publishableKey });
-  return clerkMetadataCache;
-}
-
 export const oauth = new Hono();
 
 oauth.get("/.well-known/oauth-protected-resource/mcp", (c) => {
   const origin = getPublicOrigin(c);
-  console.log("[oauth] GET /.well-known/oauth-protected-resource/mcp", { origin });
   return c.json({
     resource: `${origin}/mcp`,
     authorization_servers: [origin],
   });
 });
 
-oauth.get("/.well-known/oauth-authorization-server", async (c) => {
+oauth.get("/.well-known/oauth-authorization-server", (c) => {
   const origin = getPublicOrigin(c);
-  console.log("[oauth] GET /.well-known/oauth-authorization-server", { origin });
-  if (!clerkPublicClientId) {
-    console.error("[oauth] CLERK_PUBLIC_CLIENT_ID not set");
-    return c.text("Server misconfigured: CLERK_PUBLIC_CLIENT_ID not set", 500);
-  }
-  const clerkMetadata = await getClerkMetadata().catch((err) => {
-    console.error("[oauth] fetchClerkAuthorizationServerMetadata failed", err);
-    throw err;
-  });
   return c.json({
-    ...clerkMetadata,
     issuer: origin,
     authorization_endpoint: `${origin}/authorize`,
     token_endpoint: `${origin}/token`,
     registration_endpoint: `${origin}/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+    code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
+    subject_types_supported: ["public"],
   });
 });
 
-// Clerk has no Dynamic Client Registration, so we fake it: /register always
-// hands back the same pre-created public OAuth Application (no secret,
-// PKCE-only) instead of minting a new Clerk client per caller. This lets any
-// user add the server by URL alone - no manual client_id/secret entry -
-// while every user still does their own Clerk sign-in/consent and gets their
-// own personal access token.
+// Real Dynamic Client Registration (RFC 7591): unlike the earlier
+// Clerk-backed version, we own the whole authorization server, so we can
+// actually mint a distinct client_id per caller instead of faking it.
 oauth.post("/register", async (c) => {
-  if (!clerkPublicClientId) {
-    console.error("[oauth] POST /register: CLERK_PUBLIC_CLIENT_ID not set");
-    return c.json({ error: "invalid_request", error_description: "Dynamic registration is not configured" }, 400);
-  }
   const body = await c.req
     .json<{ redirect_uris?: string[] }>()
     .catch((): { redirect_uris?: string[] } => ({}));
-  console.log("[oauth] POST /register", { redirect_uris: body.redirect_uris });
+  const redirectUris = body.redirect_uris ?? [];
+  if (redirectUris.length === 0) {
+    return c.json({ error: "invalid_client_metadata", error_description: "redirect_uris is required" }, 400);
+  }
+
+  const clientId = randomUUID();
+  registeredClients.set(clientId, { redirectUris });
+
   return c.json(
     {
-      client_id: clerkPublicClientId,
+      client_id: clientId,
       token_endpoint_auth_method: "none",
-      grant_types: ["authorization_code", "refresh_token"],
+      grant_types: ["authorization_code"],
       response_types: ["code"],
-      redirect_uris: body.redirect_uris ?? [],
+      redirect_uris: redirectUris,
     },
     201
   );
 });
 
-// Thin proxies to Clerk's real authorize/token endpoints, always substituting
-// in the one shared public client_id regardless of what the caller sends.
-oauth.get("/authorize", async (c) => {
-  if (!clerkPublicClientId) {
-    console.error("[oauth] GET /authorize: CLERK_PUBLIC_CLIENT_ID not set");
-    return c.text("Server misconfigured: CLERK_PUBLIC_CLIENT_ID not set", 500);
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]!);
+}
+
+// No real login - this page IS the entire authentication step. Approve
+// mints an authorization code for whoever clicked it; Reject sends the
+// client an access_denied error. See the module-level comment for why.
+oauth.get("/authorize", (c) => {
+  const { response_type, client_id, redirect_uri, code_challenge, code_challenge_method, state, scope } =
+    c.req.query();
+
+  const client = client_id ? registeredClients.get(client_id) : undefined;
+  if (!client) return c.json({ error: "invalid_client" }, 400);
+  if (!redirect_uri || !client.redirectUris.includes(redirect_uri)) {
+    return c.json({ error: "invalid_request", error_description: "redirect_uri does not match registration" }, 400);
   }
-  const clerkMetadata = await getClerkMetadata();
-  const target = new URL(clerkMetadata.authorization_endpoint);
-  for (const [key, value] of new URL(c.req.url).searchParams) {
-    target.searchParams.set(key, value);
+  if (response_type !== "code") return c.json({ error: "unsupported_response_type" }, 400);
+  if (!code_challenge || code_challenge_method !== "S256") {
+    return c.json({ error: "invalid_request", error_description: "PKCE (S256) is required" }, 400);
   }
-  target.searchParams.set("client_id", clerkPublicClientId);
-  console.log("[oauth] GET /authorize -> redirecting to Clerk", {
-    incomingParams: Object.fromEntries(new URL(c.req.url).searchParams),
-    target: target.toString(),
+
+  const requestId = randomUUID();
+  pendingAuthRequests.set(requestId, { clientId: client_id, redirectUri: redirect_uri, codeChallenge: code_challenge, state, scope: scope ?? "" });
+
+  return c.html(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Authorize MCP access</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 480px; margin: 4rem auto; text-align: center;">
+  <h1>Authorize access</h1>
+  <p>An application is requesting access to this MCP server.</p>
+  <p style="color: #666; font-size: 0.9em;">Client: ${escapeHtml(client_id)}</p>
+  <form method="POST" action="/authorize/decision" style="display: flex; gap: 1rem; justify-content: center; margin-top: 2rem;">
+    <input type="hidden" name="request_id" value="${escapeHtml(requestId)}">
+    <button type="submit" name="decision" value="approve" style="padding: 0.75rem 1.5rem; font-size: 1rem; cursor: pointer;">Approve</button>
+    <button type="submit" name="decision" value="reject" style="padding: 0.75rem 1.5rem; font-size: 1rem; cursor: pointer;">Reject</button>
+  </form>
+</body>
+</html>`);
+});
+
+oauth.post("/authorize/decision", async (c) => {
+  const body = await c.req.parseBody();
+  const requestId = String(body.request_id ?? "");
+  const decision = String(body.decision ?? "");
+
+  const pending = pendingAuthRequests.get(requestId);
+  if (!pending) return c.json({ error: "invalid_request", error_description: "unknown or expired request" }, 400);
+  pendingAuthRequests.delete(requestId); // single-use
+
+  const redirectTarget = new URL(pending.redirectUri);
+  if (pending.state) redirectTarget.searchParams.set("state", pending.state);
+
+  if (decision !== "approve") {
+    redirectTarget.searchParams.set("error", "access_denied");
+    return c.redirect(redirectTarget.toString());
+  }
+
+  const code = randomUUID();
+  pendingCodes.set(code, {
+    clientId: pending.clientId,
+    redirectUri: pending.redirectUri,
+    codeChallenge: pending.codeChallenge,
+    scope: pending.scope,
+    expiresAt: Date.now() + 60_000,
   });
-  return c.redirect(target.toString());
+  redirectTarget.searchParams.set("code", code);
+  return c.redirect(redirectTarget.toString());
 });
 
 oauth.post("/token", async (c) => {
-  if (!clerkPublicClientId) {
-    console.error("[oauth] POST /token: CLERK_PUBLIC_CLIENT_ID not set");
-    return c.text("Server misconfigured: CLERK_PUBLIC_CLIENT_ID not set", 500);
-  }
-  const clerkMetadata = await getClerkMetadata();
-  const incoming = await c.req.formData();
-  const outgoing = new URLSearchParams();
-  for (const [key, value] of incoming) {
-    if (key === "client_id" || key === "client_secret") continue;
-    outgoing.set(key, String(value));
-  }
-  outgoing.set("client_id", clerkPublicClientId);
+  const body = await c.req.parseBody();
+  const { grant_type, code, redirect_uri, client_id, code_verifier } = body as Record<string, string>;
 
-  console.log("[oauth] POST /token -> forwarding to Clerk", {
-    grant_type: outgoing.get("grant_type"),
-    redirect_uri: outgoing.get("redirect_uri"),
-    hasCode: outgoing.has("code"),
-    hasCodeVerifier: outgoing.has("code_verifier"),
-    hasRefreshToken: outgoing.has("refresh_token"),
-    target: clerkMetadata.token_endpoint,
-  });
+  if (grant_type !== "authorization_code") return c.json({ error: "unsupported_grant_type" }, 400);
 
-  const upstream = await fetch(clerkMetadata.token_endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: outgoing,
-  });
-  if (!upstream.ok) {
-    const body = await upstream.clone().text();
-    console.error("[oauth] Clerk token exchange failed", { status: upstream.status, body });
-  } else {
-    console.log("[oauth] Clerk token exchange succeeded", { status: upstream.status });
+  const pending = code ? pendingCodes.get(code) : undefined;
+  if (!pending || pending.expiresAt < Date.now()) {
+    return c.json({ error: "invalid_grant", error_description: "code unknown or expired" }, 400);
   }
-  return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
+  pendingCodes.delete(code); // single-use
+
+  if (pending.clientId !== client_id || pending.redirectUri !== redirect_uri) {
+    return c.json({ error: "invalid_grant" }, 400);
+  }
+  if (!code_verifier) return c.json({ error: "invalid_request", error_description: "missing code_verifier" }, 400);
+
+  const computedChallenge = createHash("sha256").update(code_verifier).digest("base64url");
+  if (computedChallenge !== pending.codeChallenge) {
+    return c.json({ error: "invalid_grant", error_description: "PKCE verification failed" }, 400);
+  }
+
+  const accessToken = await new SignJWT({ scope: pending.scope, clientId: pending.clientId })
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject(pending.clientId)
+    .setIssuedAt()
+    .setExpirationTime("30d")
+    .sign(jwtSecret);
+
+  return c.json({
+    access_token: accessToken,
+    token_type: "Bearer",
+    expires_in: 60 * 60 * 24 * 30,
+    scope: pending.scope,
+  });
 });
 
-// Accepts either a Clerk-issued OAuth token or the static MCP_AUTH_TOKEN
+// Accepts either a self-issued OAuth token or the static MCP_AUTH_TOKEN
 // (for Claude Desktop's header-based config, which has no OAuth flow).
-const authenticateMcpRequest = mcpAuth(async (token, c) => {
-  console.log("[mcp-auth] POST /mcp auth check", { hasToken: Boolean(token), tokenPrefix: token?.slice(0, 12) });
+const authenticateMcpRequest = mcpAuth(async (token) => {
   if (mcpAuthToken && token === mcpAuthToken) {
-    console.log("[mcp-auth] matched static MCP_AUTH_TOKEN");
     return { token, scopes: [], clientId: "mcp-auth-token", extra: { userId: "mcp-auth-token" } };
   }
-  const authData = getAuth(c, { acceptsToken: "oauth_token" });
-  if (!authData.isAuthenticated) {
-    console.error("[mcp-auth] getAuth reported not authenticated", {
-      hasToken: Boolean(token),
-      tokenPrefix: token?.slice(0, 12),
-      reason: (authData as { reason?: unknown }).reason,
-    });
-    return undefined;
-  }
   try {
-    const result = await verifyClerkToken(authData, token);
-    console.log("[mcp-auth] verifyClerkToken succeeded", { userId: (result as { extra?: { userId?: unknown } })?.extra?.userId });
-    return result;
-  } catch (err) {
-    console.error("[mcp-auth] verifyClerkToken threw", err);
-    throw err;
+    const { payload } = await jwtVerify(token, jwtSecret);
+    const clientId = typeof payload.clientId === "string" ? payload.clientId : "unknown-client";
+    return { token, scopes: [], clientId, extra: { userId: clientId } };
+  } catch {
+    return undefined;
   }
 });
 
-// clerkMiddleware() is scoped to just this route (not applied globally in
-// index.ts) because it proactively tries to establish/verify Clerk session
-// state on every request it wraps - including, when mounted globally, on
-// /authorize itself. On a Clerk *development* instance (no stable custom
-// domain) that triggers Clerk's cookie-sync "handshake" redirect, and
-// re-entering /authorize mid-flow was re-triggering it, causing a redirect
-// loop that never reached Clerk's real login screen. /authorize, /register,
-// and /token are pure proxies that never call getAuth() and don't need this
-// middleware at all.
-oauth.post("/mcp", clerkMiddleware(), authenticateMcpRequest, streamableHttpHandler(createMcpServer));
+oauth.post("/mcp", authenticateMcpRequest, streamableHttpHandler(createMcpServer));
