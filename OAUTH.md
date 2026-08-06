@@ -1,145 +1,113 @@
 # OAuth on this MCP server: how it works
 
 This server exposes an MCP endpoint at `/mcp` that MCP clients (Claude
-Desktop, Claude.ai, etc.) authenticate to via OAuth. The implementation
-lives in `src/oauth.ts`. This doc explains what it does and why.
+Desktop, Claude.ai, etc.) authenticate to via OAuth. The implementation is
+split across `src/auth.ts` (the authorization server + identity engine)
+and `src/oauth.ts` (the thin layer exposing it at the paths an MCP client
+expects). This doc explains what it does and why.
 
-## No external identity provider
+## better-auth, not an external identity SaaS
 
-This server is its own, complete OAuth 2.0 authorization server — there's
-no Clerk, Auth0, or any other identity provider behind it. There's also no
-real user login: `/authorize` renders a plain page with **Approve** and
-**Reject** buttons, and clicking Approve *is* the entire authentication
-step. Whoever reaches the server's URL can grant themselves access.
+This server is its own OAuth 2.0 / OIDC authorization server, using
+[better-auth](https://better-auth.com) - a self-hosted, open-source
+TypeScript library - rather than a hosted identity provider. Users sign in
+with **Google**; better-auth handles the Google OAuth mechanics, and owns
+its own local SQLite database of users, sessions, registered OAuth
+clients, and access tokens. There's no external account portal, no
+separate dashboard to misconfigure, no dev/production instance split.
 
-This is a deliberate simplification for a personal/low-stakes server. It
-trades real identity and access control for having zero external
-dependencies and zero moving parts to misconfigure. Don't reuse this
-pattern for anything that needs to know *who* is authenticating, or that
-needs to keep specific people out.
-
-(An earlier version of this server delegated identity to Clerk. That added
-real user login, but also a distinct-per-provider category of integration
-bugs — see the git history around `src/oauth.ts` if you want the details.
-This version removes that entire dependency.)
+(Two earlier iterations of this server used Clerk as the identity
+provider, then a stateless anonymous Approve/Reject page with no identity
+at all - see git history around `src/oauth.ts` for why each was replaced.
+Clerk's development-instance cookie-sync "handshake" mechanism, needed
+because a dev instance has no stable custom domain, turned out to interact
+badly with this server's redirect-based OAuth proxy in ways that were hard
+to diagnose and never fully resolved.)
 
 ## The endpoints, in the order a client hits them
 
-### 1. `GET /.well-known/oauth-protected-resource/mcp`
+### 1. `GET /.well-known/oauth-protected-resource/mcp` and `GET /.well-known/oauth-authorization-server`
 
-Per RFC 9728, the client's first move is asking "who's the authorization
-server for this resource?" We answer with ourselves:
+Hand-written in `oauth.ts` (RFC 9728 and RFC 8414 respectively), deriving
+the origin from `X-Forwarded-Proto`/`X-Forwarded-Host` rather than the
+request's own URL - Render terminates TLS at the edge and forwards plain
+HTTP internally, so trusting the raw request URL would advertise `http://`
+endpoints that clients correctly refuse to use for a token exchange.
 
-```json
-{ "resource": "https://<our-domain>/mcp", "authorization_servers": ["https://<our-domain>"] }
-```
+`authorization_endpoint` and `token_endpoint` point directly at
+better-auth's real routes (`/api/auth/mcp/authorize`, `/api/auth/mcp/token`);
+`registration_endpoint` points at our own `/register` (see below).
 
-### 2. `GET /.well-known/oauth-authorization-server`
+### 2. `POST /register`
 
-Per RFC 8414, standard metadata describing our own endpoints:
+better-auth's real Dynamic Client Registration endpoint
+(`/api/auth/mcp/register`) has two rough edges for real MCP clients:
+it requires `client_name` (a NOT-NULL database column) and defaults
+`token_endpoint_auth_method` to `client_secret_basic` (a confidential
+client) if omitted. Claude.ai's actual registration request sends neither
+field - it expects a nameless, secret-less public client. `oauth.ts`'s
+`/register` fills in both defaults (`client_name: "MCP Client"`,
+`token_endpoint_auth_method: "none"`) before forwarding to the real
+endpoint, so every caller gets a public, PKCE-only client without having
+to ask for one explicitly.
 
-```json
-{
-  "issuer": "https://<our-domain>",
-  "authorization_endpoint": "https://<our-domain>/authorize",
-  "token_endpoint": "https://<our-domain>/token",
-  "registration_endpoint": "https://<our-domain>/register",
-  "code_challenge_methods_supported": ["S256"],
-  "token_endpoint_auth_methods_supported": ["none"]
-}
-```
+### 3. `GET /authorize` — proxied straight through
 
-`token_endpoint_auth_methods_supported: ["none"]` signals a public-client
-flow (PKCE, no client secret) — appropriate since every client here is a
-public client and none can safely hold a secret.
+Forwards the query string as-is to `/api/auth/mcp/authorize`. From here,
+better-auth's own logic takes over:
 
-Both this and the previous endpoint derive their own URL from
-`X-Forwarded-Proto`/`X-Forwarded-Host` rather than the request's own
-scheme (`getPublicOrigin()` in `oauth.ts`). Render terminates TLS at the
-edge and forwards plain HTTP internally, so trusting the raw request URL
-would advertise `http://` endpoints — which clients correctly refuse to
-exchange a code against.
+- **No session yet** → redirects to our `loginPage` (`/authorize/login`),
+  preserving every original query param so they survive the round trip.
+- **`prompt=consent` in the request** (which is what Claude.ai actually
+  sends) → redirects to our `consentPage` (`/authorize/consent`) instead.
+- **Otherwise** → issues the authorization code immediately.
 
-### 3. `POST /register` — real Dynamic Client Registration
+### 4. `GET /authorize/login`
 
-Unlike a proxy in front of a DCR-less identity provider, we own the whole
-authorization server, so registration is real (RFC 7591): each caller gets
-its own freshly minted `client_id`, stored in memory alongside its
-`redirect_uris`.
+Our own page: a single "Sign in with Google" button. Clicking it calls
+better-auth's `/api/auth/sign-in/social` with `provider: "google"` and a
+`callbackURL` of `/authorize?<original query>`, which returns a real
+Google OAuth URL (`accounts.google.com/o/oauth2/v2/auth`, with its own PKCE
+pair) to redirect the browser to. This is the one unavoidable browser hop
+in the whole flow - Google requires interactive login, there's no
+backend-only way to verify a Google identity.
 
-```json
-{
-  "client_id": "<uuid>",
-  "token_endpoint_auth_method": "none",
-  "grant_types": ["authorization_code"],
-  "response_types": ["code"],
-  "redirect_uris": ["...whatever the caller sent..."]
-}
-```
+After the user authenticates with Google, Google redirects to
+`/api/auth/callback/google` (better-auth's callback, which must be
+registered as an authorized redirect URI in Google Cloud Console).
+better-auth creates the session and redirects back to the original
+`/authorize?...` URL from `callbackURL` - now with a session, so step 3's
+logic proceeds to the consent check.
 
-### 4. `GET /authorize` — the entire "login" step
+### 5. `GET /authorize/consent`
 
-Validates `client_id` against what was registered, checks `redirect_uri`
-matches exactly, requires PKCE (`code_challenge` + `code_challenge_method:
-S256` — no PKCE, no request), and stores the pending request in memory
-keyed by a random `request_id`. It then renders a plain HTML page:
+Our own Approve/Reject page. better-auth redirects here with
+`consent_code`, `client_id`, and `scope` as query params. Approve and
+Reject both `POST` to better-auth's real `/api/auth/oauth2/consent` with
+`{ accept, consent_code }`, which returns `{ redirectURI }` as JSON (not
+an HTTP redirect) - a few lines of inline JS just follow it. On accept,
+that URI is the client's `redirect_uri` with a real authorization code; on
+reject, it's the same URL with `error=access_denied`.
 
-```
-Authorize access
-An application is requesting access to this MCP server.
-Client: <client_id>
-[ Approve ]  [ Reject ]
-```
+### 6. `POST /api/auth/mcp/token` (mounted directly, no wrapper needed)
 
-There is no username, password, or session check here. This page *is* the
-consent screen and the authentication check, combined into one button.
-
-### 5. `POST /authorize/decision`
-
-Handles the button click. On **Approve**: mints a single-use authorization
-code (60-second expiry), and redirects to the client's `redirect_uri` with
-`?code=...&state=...`. On **Reject**: redirects with `?error=access_denied`
-instead. Either way, the pending request is deleted (single-use).
-
-### 6. `POST /token`
-
-Standard Authorization Code + PKCE exchange:
-
-1. Look up the code; reject if unknown, expired, or already used (deleted
-   on first use).
-2. Confirm `client_id`/`redirect_uri` match what was authorized.
-3. Recompute `SHA256(code_verifier)` and compare to the stored
-   `code_challenge` — this is what stops a stolen authorization code from
-   being redeemed by anyone other than whoever generated the original PKCE
-   pair.
-4. On success, sign and return our own access token:
-
-```json
-{
-  "access_token": "<JWT, 30 day expiry>",
-  "token_type": "Bearer",
-  "expires_in": 2592000,
-  "scope": ""
-}
-```
-
-The token is a JWT signed with `OAUTH_JWT_SECRET` (or a random secret
-generated at boot if unset — meaning every restart invalidates all
-previously issued tokens). Its payload just carries the `client_id`; there's
-no real user identity to carry, since none was ever established.
+Standard Authorization Code + PKCE exchange, entirely handled by
+better-auth: validates the code, confirms the PKCE `code_verifier` against
+the stored `code_challenge`, and returns an access token plus (since the
+default scopes include `openid`) an `id_token` carrying the user's real
+Google-verified name and email.
 
 ### 7. `POST /mcp` — verifying the token
 
-Every `/mcp` request goes through `authenticateMcpRequest`, built with
-`@clerk/mcp-tools/hono`'s `mcpAuth()` wrapper. Despite the package name,
-`mcpAuth()` and `streamableHttpHandler()` are generic — they just need a
-plain `(token) => AuthInfo | undefined` callback, with no Clerk-specific
-logic. Ours accepts either:
+`authenticateMcpRequest` (built with `@clerk/mcp-tools/hono`'s `mcpAuth()`
+wrapper - generic despite the package name, just a plain token-verify
+callback) accepts either:
 
-- A static `MCP_AUTH_TOKEN` (env var) — the escape hatch for Claude
+- A static `MCP_AUTH_TOKEN` (env var) - the escape hatch for Claude
   Desktop's header-based config, which has no OAuth flow at all.
-- A JWT signed by this server — verified against `OAUTH_JWT_SECRET`,
-  nothing else to check.
+- A real better-auth access token - verified via `auth.api.getMcpSession()`,
+  which returns the associated `userId`/`clientId`/`scopes` for
+  `createMcpServer`'s tools to use (e.g. `createdBy`/`updatedBy` tracking).
 
 ## Required environment variables
 
@@ -147,14 +115,26 @@ From `.env.example`:
 
 | Variable | Purpose |
 |---|---|
+| `PUBLIC_URL` | Exact externally-reachable origin (scheme included). better-auth needs this as a fixed value up front - unlike our own routes, it can't infer it per-request. |
 | `MCP_AUTH_TOKEN` | Static bearer token accepted as an OAuth alternative (Claude Desktop) |
-| `OAUTH_JWT_SECRET` | Signs/verifies our own access tokens. If unset, a random secret is generated at boot and all tokens become invalid on the next restart. |
+| `BETTER_AUTH_SECRET` | Signs better-auth's session cookies and internal tokens |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | From Google Cloud Console; authorized redirect URI must be exactly `${PUBLIC_URL}/api/auth/callback/google` |
+| `AUTH_DB_PATH` | SQLite file storing users/sessions/clients/tokens (default `./data/auth.db`) |
 
-## What this intentionally doesn't do
+**Important**: on Render's free tier the filesystem is ephemeral - the
+SQLite file is wiped on every deploy/restart, meaning every registered
+client and every logged-in session is lost each time. Attach a persistent
+disk, or point `database` in `src/auth.ts` at a managed Postgres/MySQL
+instance instead (better-auth supports both via the same config option),
+if that's not acceptable.
 
-There's no real authentication, no way to know who approved a request, no
-way to revoke a single token early (only rotating `OAUTH_JWT_SECRET`
-invalidates everything at once), and no refresh tokens (access tokens are
-just long-lived — 30 days — instead). If any of that becomes necessary,
-that's the point at which a real identity provider (or at least a password
-on the consent page) is worth reintroducing.
+## What's genuinely ours vs. better-auth's
+
+`src/auth.ts` configures better-auth (Google provider, the `mcp` plugin,
+`loginPage`/`consentPage` routes) and runs its migrations at boot.
+`src/oauth.ts` is the thin layer: the two hand-written `.well-known`
+documents (needed because better-auth's own metadata endpoints are mounted
+under `/api/auth/`, not at the root paths MCP clients expect), the
+`/register` defaulting shim, and our own login/consent page HTML. Every
+actual OAuth mechanic - DCR, PKCE, code issuance, token issuance, session
+management, Google's OAuth dance - is better-auth's, not hand-rolled.

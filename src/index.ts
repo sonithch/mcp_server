@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { oauth } from "./oauth.js";
+import { runAuthMigrations } from "./auth.js";
 import {
   listItems,
   getItem,
@@ -85,6 +86,9 @@ app.delete("/items/:id", (c) => {
 });
 
 const port = Number(process.env.PORT) || 3001;
+
+await runAuthMigrations();
+
 console.log(`Server running at http://localhost:${port}`);
 console.log(`MCP endpoint: http://localhost:${port}/mcp`);
 
