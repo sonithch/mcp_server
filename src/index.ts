@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { logger } from "hono/logger";
 import { clerkMiddleware } from "@clerk/hono";
 import { oauth } from "./oauth.js";
 import {
@@ -15,6 +16,7 @@ import {
 
 const app = new Hono();
 
+app.use("*", logger());
 app.use(
   "*",
   cors({

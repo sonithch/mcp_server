@@ -28,6 +28,7 @@ export const oauth = new Hono();
 
 oauth.get("/.well-known/oauth-protected-resource/mcp", (c) => {
   const origin = new URL(c.req.url).origin;
+  console.log("[oauth] GET /.well-known/oauth-protected-resource/mcp", { origin });
   return c.json({
     resource: `${origin}/mcp`,
     authorization_servers: [origin],
@@ -35,9 +36,16 @@ oauth.get("/.well-known/oauth-protected-resource/mcp", (c) => {
 });
 
 oauth.get("/.well-known/oauth-authorization-server", async (c) => {
-  if (!clerkPublicClientId) return c.text("Server misconfigured: CLERK_PUBLIC_CLIENT_ID not set", 500);
   const origin = new URL(c.req.url).origin;
-  const clerkMetadata = await getClerkMetadata();
+  console.log("[oauth] GET /.well-known/oauth-authorization-server", { origin });
+  if (!clerkPublicClientId) {
+    console.error("[oauth] CLERK_PUBLIC_CLIENT_ID not set");
+    return c.text("Server misconfigured: CLERK_PUBLIC_CLIENT_ID not set", 500);
+  }
+  const clerkMetadata = await getClerkMetadata().catch((err) => {
+    console.error("[oauth] fetchClerkAuthorizationServerMetadata failed", err);
+    throw err;
+  });
   return c.json({
     ...clerkMetadata,
     issuer: origin,
@@ -56,11 +64,13 @@ oauth.get("/.well-known/oauth-authorization-server", async (c) => {
 // own personal access token.
 oauth.post("/register", async (c) => {
   if (!clerkPublicClientId) {
+    console.error("[oauth] POST /register: CLERK_PUBLIC_CLIENT_ID not set");
     return c.json({ error: "invalid_request", error_description: "Dynamic registration is not configured" }, 400);
   }
   const body = await c.req
     .json<{ redirect_uris?: string[] }>()
     .catch((): { redirect_uris?: string[] } => ({}));
+  console.log("[oauth] POST /register", { redirect_uris: body.redirect_uris });
   return c.json(
     {
       client_id: clerkPublicClientId,
@@ -76,18 +86,28 @@ oauth.post("/register", async (c) => {
 // Thin proxies to Clerk's real authorize/token endpoints, always substituting
 // in the one shared public client_id regardless of what the caller sends.
 oauth.get("/authorize", async (c) => {
-  if (!clerkPublicClientId) return c.text("Server misconfigured: CLERK_PUBLIC_CLIENT_ID not set", 500);
+  if (!clerkPublicClientId) {
+    console.error("[oauth] GET /authorize: CLERK_PUBLIC_CLIENT_ID not set");
+    return c.text("Server misconfigured: CLERK_PUBLIC_CLIENT_ID not set", 500);
+  }
   const clerkMetadata = await getClerkMetadata();
   const target = new URL(clerkMetadata.authorization_endpoint);
   for (const [key, value] of new URL(c.req.url).searchParams) {
     target.searchParams.set(key, value);
   }
   target.searchParams.set("client_id", clerkPublicClientId);
+  console.log("[oauth] GET /authorize -> redirecting to Clerk", {
+    incomingParams: Object.fromEntries(new URL(c.req.url).searchParams),
+    target: target.toString(),
+  });
   return c.redirect(target.toString());
 });
 
 oauth.post("/token", async (c) => {
-  if (!clerkPublicClientId) return c.text("Server misconfigured: CLERK_PUBLIC_CLIENT_ID not set", 500);
+  if (!clerkPublicClientId) {
+    console.error("[oauth] POST /token: CLERK_PUBLIC_CLIENT_ID not set");
+    return c.text("Server misconfigured: CLERK_PUBLIC_CLIENT_ID not set", 500);
+  }
   const clerkMetadata = await getClerkMetadata();
   const incoming = await c.req.formData();
   const outgoing = new URLSearchParams();
@@ -97,23 +117,54 @@ oauth.post("/token", async (c) => {
   }
   outgoing.set("client_id", clerkPublicClientId);
 
+  console.log("[oauth] POST /token -> forwarding to Clerk", {
+    grant_type: outgoing.get("grant_type"),
+    redirect_uri: outgoing.get("redirect_uri"),
+    hasCode: outgoing.has("code"),
+    hasCodeVerifier: outgoing.has("code_verifier"),
+    hasRefreshToken: outgoing.has("refresh_token"),
+    target: clerkMetadata.token_endpoint,
+  });
+
   const upstream = await fetch(clerkMetadata.token_endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: outgoing,
   });
+  if (!upstream.ok) {
+    const body = await upstream.clone().text();
+    console.error("[oauth] Clerk token exchange failed", { status: upstream.status, body });
+  } else {
+    console.log("[oauth] Clerk token exchange succeeded", { status: upstream.status });
+  }
   return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
 });
 
 // Accepts either a Clerk-issued OAuth token or the static MCP_AUTH_TOKEN
 // (for Claude Desktop's header-based config, which has no OAuth flow).
 const authenticateMcpRequest = mcpAuth(async (token, c) => {
+  console.log("[mcp-auth] POST /mcp auth check", { hasToken: Boolean(token), tokenPrefix: token?.slice(0, 12) });
   if (mcpAuthToken && token === mcpAuthToken) {
+    console.log("[mcp-auth] matched static MCP_AUTH_TOKEN");
     return { token, scopes: [], clientId: "mcp-auth-token", extra: { userId: "mcp-auth-token" } };
   }
   const authData = getAuth(c, { acceptsToken: "oauth_token" });
-  if (!authData.isAuthenticated) return undefined;
-  return verifyClerkToken(authData, token);
+  if (!authData.isAuthenticated) {
+    console.error("[mcp-auth] getAuth reported not authenticated", {
+      hasToken: Boolean(token),
+      tokenPrefix: token?.slice(0, 12),
+      reason: (authData as { reason?: unknown }).reason,
+    });
+    return undefined;
+  }
+  try {
+    const result = await verifyClerkToken(authData, token);
+    console.log("[mcp-auth] verifyClerkToken succeeded", { userId: (result as { extra?: { userId?: unknown } })?.extra?.userId });
+    return result;
+  } catch (err) {
+    console.error("[mcp-auth] verifyClerkToken threw", err);
+    throw err;
+  }
 });
 
 oauth.post("/mcp", authenticateMcpRequest, streamableHttpHandler(createMcpServer));
