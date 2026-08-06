@@ -16,6 +16,20 @@ import { createMcpServer } from "./mcp-server.js";
 const mcpAuthToken = process.env.MCP_AUTH_TOKEN;
 const clerkPublicClientId = process.env.CLERK_PUBLIC_CLIENT_ID;
 
+// Render (and most PaaS providers) terminate TLS at the edge and forward
+// plain HTTP internally, so c.req.url's own scheme is always "http" even
+// though the real, public-facing request was https. Self-advertising
+// "http://" endpoints in our OAuth metadata makes them unusable: clients
+// correctly refuse to exchange an authorization code for tokens over an
+// unencrypted URL, so /token was silently never being called. Trust
+// X-Forwarded-Proto/Host (set by the proxy) over the request's own URL.
+function getPublicOrigin(c: { req: { url: string; header: (name: string) => string | undefined } }): string {
+  const url = new URL(c.req.url);
+  const proto = c.req.header("x-forwarded-proto")?.split(",")[0]?.trim() ?? url.protocol.replace(":", "");
+  const host = c.req.header("x-forwarded-host")?.split(",")[0]?.trim() ?? url.host;
+  return `${proto}://${host}`;
+}
+
 let clerkMetadataCache: Awaited<ReturnType<typeof fetchClerkAuthorizationServerMetadata>> | undefined;
 async function getClerkMetadata() {
   const publishableKey = process.env.CLERK_PUBLISHABLE_KEY;
@@ -27,7 +41,7 @@ async function getClerkMetadata() {
 export const oauth = new Hono();
 
 oauth.get("/.well-known/oauth-protected-resource/mcp", (c) => {
-  const origin = new URL(c.req.url).origin;
+  const origin = getPublicOrigin(c);
   console.log("[oauth] GET /.well-known/oauth-protected-resource/mcp", { origin });
   return c.json({
     resource: `${origin}/mcp`,
@@ -36,7 +50,7 @@ oauth.get("/.well-known/oauth-protected-resource/mcp", (c) => {
 });
 
 oauth.get("/.well-known/oauth-authorization-server", async (c) => {
-  const origin = new URL(c.req.url).origin;
+  const origin = getPublicOrigin(c);
   console.log("[oauth] GET /.well-known/oauth-authorization-server", { origin });
   if (!clerkPublicClientId) {
     console.error("[oauth] CLERK_PUBLIC_CLIENT_ID not set");
