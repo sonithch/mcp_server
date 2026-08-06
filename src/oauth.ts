@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { getAuth } from "@clerk/hono";
+import { clerkMiddleware, getAuth } from "@clerk/hono";
 import { mcpAuth, streamableHttpHandler } from "@clerk/mcp-tools/hono";
 import { fetchClerkAuthorizationServerMetadata, verifyClerkToken } from "@clerk/mcp-tools/server";
 import { createMcpServer } from "./mcp-server.js";
@@ -167,4 +167,13 @@ const authenticateMcpRequest = mcpAuth(async (token, c) => {
   }
 });
 
-oauth.post("/mcp", authenticateMcpRequest, streamableHttpHandler(createMcpServer));
+// clerkMiddleware() is scoped to just this route (not applied globally in
+// index.ts) because it proactively tries to establish/verify Clerk session
+// state on every request it wraps - including, when mounted globally, on
+// /authorize itself. On a Clerk *development* instance (no stable custom
+// domain) that triggers Clerk's cookie-sync "handshake" redirect, and
+// re-entering /authorize mid-flow was re-triggering it, causing a redirect
+// loop that never reached Clerk's real login screen. /authorize, /register,
+// and /token are pure proxies that never call getAuth() and don't need this
+// middleware at all.
+oauth.post("/mcp", clerkMiddleware(), authenticateMcpRequest, streamableHttpHandler(createMcpServer));

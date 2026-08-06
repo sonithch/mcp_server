@@ -2,7 +2,6 @@ import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
-import { clerkMiddleware } from "@clerk/hono";
 import { oauth } from "./oauth.js";
 import {
   listItems,
@@ -26,8 +25,6 @@ app.use(
     exposeHeaders: ["mcp-session-id", "mcp-protocol-version"],
   })
 );
-app.use("*", clerkMiddleware());
-
 app.get("/health", (c) => c.json({ status: "ok" }));
 
 app.route("/", oauth);
