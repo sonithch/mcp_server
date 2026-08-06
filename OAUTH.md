@@ -7,21 +7,16 @@ lives in `src/oauth.ts`. This doc explains what it does and why.
 ## No external identity provider
 
 This server is its own, complete OAuth 2.0 authorization server — there's
-no Clerk, Auth0, or any other identity provider behind it. There's also no
-real user login: `/authorize` renders a plain page with **Approve** and
-**Reject** buttons, and clicking Approve *is* the entire authentication
-step. Whoever reaches the server's URL can grant themselves access.
+no external identity provider behind it. There's also no real user login:
+`/authorize` renders a plain page with **Approve** and **Reject** buttons,
+and clicking Approve *is* the entire authentication step. Whoever reaches
+the server's URL can grant themselves access.
 
 This is a deliberate simplification for a personal/low-stakes server. It
 trades real identity and access control for having zero external
 dependencies and zero moving parts to misconfigure. Don't reuse this
 pattern for anything that needs to know *who* is authenticating, or that
 needs to keep specific people out.
-
-(An earlier version of this server delegated identity to Clerk. That added
-real user login, but also a distinct-per-provider category of integration
-bugs — see the git history around `src/oauth.ts` if you want the details.
-This version removes that entire dependency.)
 
 ## The endpoints, in the order a client hits them
 
@@ -130,11 +125,11 @@ no real user identity to carry, since none was ever established.
 
 ### 7. `POST /mcp` — verifying the token
 
-Every `/mcp` request goes through `authenticateMcpRequest`, built with
-`@clerk/mcp-tools/hono`'s `mcpAuth()` wrapper. Despite the package name,
-`mcpAuth()` and `streamableHttpHandler()` are generic — they just need a
-plain `(token) => AuthInfo | undefined` callback, with no Clerk-specific
-logic. Ours accepts either:
+Every `/mcp` request goes through `authenticateMcpRequest`, built with a
+third-party `mcpAuth()` wrapper (`@clerk/mcp-tools/hono` — the helper
+itself is generic, just a plain `(token) => AuthInfo | undefined`
+callback, unrelated to any specific identity provider). Ours accepts
+either:
 
 - A static `MCP_AUTH_TOKEN` (env var) — the escape hatch for Claude
   Desktop's header-based config, which has no OAuth flow at all.
