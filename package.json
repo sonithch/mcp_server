@@ -13,6 +13,7 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "hono": "^4.6.0",
     "jose": "^6.2.8",
+    "postgres": "^3.4.9",
     "zod": "^4.4.3"
   },
   "devDependencies": {

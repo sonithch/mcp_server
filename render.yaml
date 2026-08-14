@@ -9,3 +9,13 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 22
+      # Stable across deploys, so access tokens aren't invalidated every
+      # time the service restarts.
+      - key: OAUTH_JWT_SECRET
+        generateValue: true
+      # Supabase transaction-pooler connection string (port 6543). Set in
+      # the Render dashboard - never commit it.
+      - key: DATABASE_URL
+        sync: false
+      - key: MCP_AUTH_TOKEN
+        sync: false

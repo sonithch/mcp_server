@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { oauth } from "./oauth.js";
+import { migrate, sweepExpired } from "./db.js";
 import {
   listItems,
   getItem,
@@ -85,6 +86,18 @@ app.delete("/items/:id", (c) => {
 });
 
 const port = Number(process.env.PORT) || 3001;
+
+// The schema is created before the server accepts traffic - a boot that
+// can't reach Postgres should fail loudly rather than serve an OAuth
+// server that silently can't remember anyone.
+await migrate();
+
+// Abandoned auth flows and long-dead tokens would otherwise accumulate.
+sweepExpired().catch((err) => console.error("[db] sweep failed", err));
+setInterval(() => {
+  sweepExpired().catch((err) => console.error("[db] sweep failed", err));
+}, 60 * 60 * 1000).unref();
+
 console.log(`Server running at http://localhost:${port}`);
 console.log(`MCP endpoint: http://localhost:${port}/mcp`);
 
